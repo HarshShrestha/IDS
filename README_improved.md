@@ -123,8 +123,25 @@ Network Interface
 ### Machine Learning Extension
 Current version is intentionally rule-based.
 
-```text
-Packets -> Feature Extraction -> Feature Vector -> Random Forest / Isolation Forest -> Normal | SYN Scan | Port Scan | SYN Flood | Unknown Anomaly
-```
+Packets
+    │
+    ▼
+Scapy Sniffer
+    │
+    ▼
+Packet Parser
+    │
+    ▼
+Detection Engine
+    │
+ ┌──┴───────────────┐
+ │                  │
+SYN Scan       Port Scan
+ │                  │
+ └──────┬───────────┘
+        ▼
+ Alert Manager
+        ▼
+ alerts.log
 
 Potential datasets: CICIDS2017, UNSW-NB15, CICDDoS2019.
