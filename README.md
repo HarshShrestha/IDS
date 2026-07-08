@@ -1,87 +1,169 @@
 # network-ids
 
-A small passive intrusion detection tool written in Python. It watches TCP
-traffic on an interface and flags three common patterns:
+`network-ids` is a small passive intrusion detection tool written in Python. It watches TCP traffic on an interface and looks for three common patterns:
 
-- **SYN scan** - one host sending SYNs really fast (the default behaviour of
-  tools like `nmap -sS`)
-- **Port scan** - one host probing a lot of distinct ports over a longer
-  window (catches slower/stealthier scans that don't trip the rate-based
-  check)
-- **SYN flood** - a target getting buried in half-open connections
+- SYN scan: one host sending SYNs very quickly
+- Port scan: one host probing many distinct destination ports
+- SYN flood: one destination receiving too many SYNs in a short time
 
-This started as a "how would I actually detect a port scan" question for
-myself, so it's intentionally simple - sliding time windows and counters,
-no ML, no signature database. Real tools (Snort, Suricata, Zeek) do this
-with a lot more sophistication, but the core idea is the same.
+The detector is intentionally simple. It uses sliding time windows and counters instead of ML or signature databases, which keeps the behavior easy to reason about and easy to test.
 
-## How detection works
+## Architecture
 
-Every incoming TCP packet with the SYN flag set (and ACK *not* set - so we
-don't count normal SYN-ACK replies) gets checked against three sliding
-windows:
+```mermaid
+flowchart LR
+    A[Packets] --> B[Scapy Sniffer]
+    B --> C[Packet Parser]
+    C --> D[Detection Engine]
+    D --> E{Alert Type}
+    E --> F[SYN Scan]
+    E --> G[Port Scan]
+    E --> H[SYN Flood]
+    F --> I[Alert Manager]
+    G --> I[Alert Manager]
+    H --> I[Alert Manager]
+    I --> J[alerts.log]
+    I --> K[Console]
+```
 
-1. How many SYNs has this source sent in the last `SYN_SCAN_WINDOW`
-   seconds? Too many -> SYN scan.
-2. How many *distinct destination ports* has this source touched in the
-   last `PORT_SCAN_WINDOW` seconds? Too many -> port scan. This is
-   separate from #1 because a slow scanner (one port every couple seconds)
-   won't trip the rate check but will still rack up distinct ports over
-   time.
-3. How many SYNs has a given `dst_ip:dst_port` received in the last
-   `FLOOD_WINDOW` seconds, regardless of source? Too many -> SYN flood.
+The control flow in `ids.py` is straightforward:
 
-Alerts have a cooldown (15s by default) per (type, key) so one ongoing
-scan doesn't spam the log with a hundred lines a second.
+- `sniff()` captures TCP packets from the chosen interface
+- `Detector.handle_packet()` filters non-IP and non-TCP packets, then ignores packets that are not pure SYNs
+- `_check_syn_scan()` tracks SYN rate per source IP
+- `_check_port_scan()` tracks distinct destination ports per source IP
+- `_check_syn_flood()` tracks SYN volume per destination IP and port
+- `_fire()` handles cooldowns, prints the alert, and appends it to `alerts.log`
 
-## Running it
+## Detection Logic
+
+The implementation in [`ids.py`](ids.py) uses these tunables:
+
+- `SYN_SCAN_WINDOW` and `SYN_SCAN_THRESHOLD`
+- `PORT_SCAN_WINDOW` and `PORT_SCAN_PORT_THRESHOLD`
+- `FLOOD_WINDOW` and `FLOOD_THRESHOLD`
+- `ALERT_COOLDOWN`
+- `STATS_INTERVAL`
+
+How each detector works:
+
+1. SYN scan: count pure SYN packets from one source inside a short window.
+2. Port scan: count distinct destination ports touched by one source inside a longer window.
+3. SYN flood: count SYNs aimed at one destination IP and port inside a short window.
+
+SYN-ACK packets are ignored so normal server replies do not look like scan traffic.
+
+## Time Complexity
+
+The core algorithms are intentionally small and efficient:
+
+### SYN Scan
+
+```text
+Insert timestamp: O(1)
+Remove expired entries: amortized O(1)
+Detection check: O(1)
+```
+
+### Port Scan
+
+```text
+Hash map insert/update: O(1)
+Prune stale ports: O(k) for the number of stale ports removed
+Threshold check: O(1)
+```
+
+### SYN Flood
+
+```text
+Insert timestamp: O(1)
+Remove expired entries: amortized O(1)
+Detection check: O(1)
+```
+
+These choices matter because the detector runs on every matching packet. Keeping insertion and threshold checks constant-time makes the design practical for a lightweight passive IDS.
+
+## Why This Architecture Works
+
+This is a rule-based detector, so the architecture is intentionally small:
+
+- One sniffing entry point keeps packet capture isolated.
+- One detector class owns all state, which keeps the tests simple.
+- Separate sliding windows prevent stale traffic from affecting current alerts.
+- Alert cooldowns prevent repeated log spam from a single ongoing event.
+- In-memory counters are enough for a learning project and make the behavior deterministic in tests.
+
+## Running The Project
+
+Install dependencies and start the detector:
 
 ```bash
 pip install -r requirements.txt
-
 sudo python3 ids.py -i eth0
 ```
 
-Needs root because scapy is doing raw socket capture. Alerts get printed
-to stdout and appended to `alerts.log`. Every 30 seconds it also prints a
-quick summary (packet counts, alert counts, top talkers by packet count).
+Root access is needed because Scapy performs raw packet capture.
 
-### Trying it against yourself
+Useful flags:
 
-If you don't have a second machine handy, you can generate traffic that
-trips the detectors from the same box (in a VM/container, don't do this on
-a network you don't control):
+- `-i` or `--iface`: interface to sniff on
+- `--log`: file where alerts are written
+- `--no-stats`: disable the periodic stats summary
+
+## Trying It Locally
+
+If you want to generate traffic against yourself in a safe lab environment, you can run:
 
 ```bash
 sudo python3 ids.py -i lo &
 nmap -sS -T4 127.0.0.1 -p 1-500
 ```
 
-You should see PORT_SCAN and/or SYN_SCAN alerts show up depending on how
-fast nmap fires.
+Depending on timing, you should see SYN_SCAN and/or PORT_SCAN alerts.
 
 ## Tests
+
+Run the test suite with:
 
 ```bash
 pip install pytest
 pytest test_ids.py -v
 ```
 
-The tests craft packets directly with scapy and feed them into
-`Detector.handle_packet()` rather than actually sniffing - no root or
-real interface needed to run the suite.
+The tests build Scapy packets in memory and call `Detector.handle_packet()` directly, so they do not need root or a live network interface.
 
-## Known limitations / things I'd do differently with more time
+## Known Limitations
 
-- Thresholds are hardcoded constants tuned by eyeballing my own traffic,
-  not anything principled. On a busier network they'd need retuning or a
-  more adaptive approach (baseline + deviation instead of a fixed number).
-- No IPv6 support right now, only IPv4.
-- SYN flood detection doesn't try to distinguish spoofed source IPs from a
-  legitimately busy server - a popular web server could plausibly trip it
-  under a traffic spike, not just an actual attack.
-- Everything's in-memory, so a restart loses all history. Fine for a demo,
-  not fine for anything long-running.
-- No allowlisting - a NAT gateway or another local scanner (Nessus, etc.)
-  running "for real" reasons would get flagged same as an attacker.
-# IDS
+- Thresholds are hardcoded and may need retuning on busier networks.
+- Only IPv4 is supported right now.
+- SYN flood detection does not distinguish spoofed traffic from legitimate spikes.
+- State is memory-only, so a restart loses all history.
+- There is no allowlist, so trusted scanners or gateways can still trigger alerts.
+
+## Future Improvements
+
+This project currently uses a rule-based detection engine based on sliding windows and predefined thresholds. Future work could improve its accuracy, scalability, and usability.
+
+- Integrate machine learning, such as Random Forest or Isolation Forest, for anomaly detection and false-positive reduction.
+- Support additional attack types such as ICMP floods, UDP floods, ARP spoofing, and brute-force attacks.
+- Add a real-time dashboard for alerts and network statistics.
+- Integrate with SIEM platforms such as Wazuh, Splunk, or Elastic Stack.
+- Make detection thresholds configurable through JSON or YAML.
+- Extend support to IPv6.
+- Build a Mininet-based testing environment for repeatable evaluation.
+- Optimize packet processing for higher traffic volumes.
+- Use structured JSON logging.
+- Containerize the application with Docker.
+
+## Future Architecture
+
+```mermaid
+flowchart LR
+    A[Network Traffic] --> B[Packet Capture\nScapy]
+    B --> C[Feature Extraction\nSYN rate, port count, flow time, packet size, connection rate]
+    C --> D{Detection Path}
+    D --> E[Rule-Based Engine\nCurrent version]
+    D --> F[ML Classifier\nFuture enhancement]
+    E --> G[Alert Generation]
+    F --> G[Alert Generation]
+```
